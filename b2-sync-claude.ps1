@@ -74,7 +74,7 @@ param(
     [string]$BrevoApiKey = "",
     
     [Parameter(Mandatory=$false)]
-    [string[]]$EmailTo = @("),
+    [string[]]$EmailTo = @(""),
     
     [Parameter(Mandatory=$false)]
     [string]$EmailFrom = "",
@@ -1014,3 +1014,4 @@ if ($BrevoApiKey -and $EmailTo.Count -gt 0 -and $EmailFrom) {
 }
 
 Write-Host ""
+
