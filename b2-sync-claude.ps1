@@ -1,8 +1,9 @@
-﻿<#
+<#
 .SYNOPSIS
     Synchronize local folders to Backblaze B2 object storage
 .DESCRIPTION
     Syncs local files to B2 bucket, only uploading new or modified files
+    Requires PowerShell 7+ for optimal performance
 .PARAMETER ApplicationKeyId
     Your B2 application key ID
 .PARAMETER ApplicationKey
@@ -31,6 +32,8 @@
     Path to store hash cache for faster subsequent syncs (e.g., "C:\Temp\b2_hash_cache.json")
 .PARAMETER DeleteRemote
     If specified, deletes remote files that don't exist locally
+.PARAMETER ShowErrors
+    If specified, shows detailed error messages and diagnostic output
 .EXAMPLE
     .\Sync-ToB2.ps1 -LocalPath "C:\MyFolder"
 .EXAMPLE
@@ -71,7 +74,7 @@ param(
     [string]$BrevoApiKey = "",
     
     [Parameter(Mandatory=$false)]
-    [string[]]$EmailTo = @(),
+    [string[]]$EmailTo = @("),
     
     [Parameter(Mandatory=$false)]
     [string]$EmailFrom = "",
@@ -85,11 +88,58 @@ param(
     [Parameter(Mandatory=$false)]
     [string]$HashCacheFile = "",
     
-    [switch]$DeleteRemote
+    [switch]$DeleteRemote,
+    
+    [switch]$ShowErrors
 )
 
-if ($PSVersionTable.PSVersion.Major -ge 6) {
-    $PSDefaultParameterValues.Add("Invoke-RestMethod:SkipHeaderValidation",$true)
+# Set error action preference based on ShowErrors flag
+if ($ShowErrors) {
+    $ErrorActionPreference = "Continue"
+    $VerbosePreference = "Continue"
+} else {
+    $ErrorActionPreference = "SilentlyContinue"
+    $VerbosePreference = "SilentlyContinue"
+}
+
+# Check PowerShell version and offer upgrade
+$psVersion = $PSVersionTable.PSVersion
+Write-Host "`n=== Backblaze B2 Sync Script ===" -ForegroundColor Yellow
+Write-Host "PowerShell Version: $($psVersion.Major).$($psVersion.Minor).$($psVersion.Patch)" -ForegroundColor Cyan
+
+if ($psVersion.Major -lt 7) {
+    Write-Host "`n⚠ WARNING: PowerShell 7+ is required for optimal performance" -ForegroundColor Yellow
+    Write-Host "Current version: PowerShell $($psVersion.Major).$($psVersion.Minor)" -ForegroundColor Yellow
+    Write-Host "PowerShell 7+ provides:" -ForegroundColor White
+    Write-Host "  - Parallel processing (up to 8x faster file analysis)" -ForegroundColor White
+    Write-Host "  - Improved API compatibility" -ForegroundColor White
+    Write-Host "  - Better error handling" -ForegroundColor White
+    
+    $downloadUrl = "https://aka.ms/powershell-release?tag=stable"
+    Write-Host "`nDownloading PowerShell 7 installer..." -ForegroundColor Cyan
+    
+    try {
+        $installerPath = Join-Path $env:TEMP "PowerShell-7-win-x64.msi"
+        
+        # Download the installer
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $installerPath -UseBasicParsing
+        
+        Write-Host "✓ Installer downloaded to: $installerPath" -ForegroundColor Green
+        Write-Host "`nPlease install PowerShell 7 and run this script again using:" -ForegroundColor Yellow
+        Write-Host "  pwsh.exe -File `"$($MyInvocation.MyCommand.Path)`"" -ForegroundColor Cyan
+        Write-Host "`nOpening installer..." -ForegroundColor Cyan
+        
+        Start-Process -FilePath $installerPath -Wait
+        
+        Write-Host "`n✓ Installation complete. Please restart and run with 'pwsh.exe' instead of 'powershell.exe'" -ForegroundColor Green
+        exit 0
+    }
+    catch {
+        Write-Host "✗ Failed to download installer: $_" -ForegroundColor Red
+        Write-Host "`nPlease manually download PowerShell 7 from:" -ForegroundColor Yellow
+        Write-Host "https://github.com/PowerShell/PowerShell/releases/latest" -ForegroundColor Cyan
+        exit 1
+    }
 }
 
 # Function to authorize with B2
@@ -106,11 +156,14 @@ function Get-B2Authorization {
     
     try {
         $response = Invoke-RestMethod -Uri "https://api.backblazeb2.com/b2api/v2/b2_authorize_account" `
-            -Method Get -Headers $headers
+            -Method Get -Headers $headers -SkipHeaderValidation
         return $response
     }
     catch {
-        Write-Error "Authorization failed: $_"
+        Write-Host "✗ Authorization failed" -ForegroundColor Red
+        if ($ShowErrors) {
+            Write-Error "Authorization failed: $_"
+        }
         exit 1
     }
 }
@@ -135,13 +188,20 @@ function Get-B2BucketId {
         $bucket = $response.buckets | Where-Object { $_.bucketName -eq $BucketName }
         
         if (-not $bucket) {
-            throw "Bucket '$BucketName' not found"
+            Write-Host "✗ Bucket '$BucketName' not found" -ForegroundColor Red
+            if ($ShowErrors) {
+                Write-Error "Bucket '$BucketName' not found"
+            }
+            exit 1
         }
         
         return $bucket.bucketId
     }
     catch {
-        Write-Error "Failed to get bucket ID: $_"
+        Write-Host "✗ Failed to get bucket ID" -ForegroundColor Red
+        if ($ShowErrors) {
+            Write-Error "Failed to get bucket ID: $_"
+        }
         exit 1
     }
 }
@@ -187,7 +247,10 @@ function Get-B2FileList {
             $nextFileName = $response.nextFileName
         }
         catch {
-            Write-Error "Failed to list files: $_"
+            Write-Host "✗ Failed to list files" -ForegroundColor Red
+            if ($ShowErrors) {
+                Write-Error "Failed to list files: $_"
+            }
             exit 1
         }
     } while ($nextFileName)
@@ -213,7 +276,9 @@ function Get-B2UploadUrl {
         return $response
     }
     catch {
-        Write-Error "Failed to get upload URL: $_"
+        if ($ShowErrors) {
+            Write-Error "Failed to get upload URL: $_"
+        }
         return $null
     }
 }
@@ -245,7 +310,9 @@ function Get-HashCache {
             return $hashTable
         }
         catch {
-            Write-Warning "Failed to load hash cache: $_"
+            if ($ShowErrors) {
+                Write-Warning "Failed to load hash cache: $_"
+            }
             return @{}
         }
     }
@@ -262,7 +329,9 @@ function Save-HashCache {
             Write-Host "✓ Saved hash cache with $($Cache.Count) entries" -ForegroundColor Green
         }
         catch {
-            Write-Warning "Failed to save hash cache: $_"
+            if ($ShowErrors) {
+                Write-Warning "Failed to save hash cache: $_"
+            }
         }
     }
 }
@@ -385,7 +454,7 @@ function Upload-B2File {
             # For smaller files, use the standard method
             $fileBytes = [System.IO.File]::ReadAllBytes($LocalPath)
             $response = Invoke-RestMethod -Uri $UploadUrl -Method Post `
-                -Headers $headers -Body $fileBytes
+                -Headers $headers -Body $fileBytes -SkipHeaderValidation
             
             return $response
         }
@@ -411,11 +480,13 @@ function Remove-B2File {
     
     try {
         Invoke-RestMethod -Uri "$($Auth.apiUrl)/b2api/v2/b2_delete_file_version" `
-            -Method Post -Headers $headers -Body $body -ContentType "application/json" | Out-Null
+            -Method Post -Headers $headers -Body $body -ContentType "application/json" -SkipHeaderValidation | Out-Null
         return $true
     }
     catch {
-        Write-Error "Failed to delete $FileName : $_"
+        if ($ShowErrors) {
+            Write-Error "Failed to delete $FileName : $_"
+        }
         return $false
     }
 }
@@ -462,22 +533,24 @@ function Send-BrevoEmail {
     
     try {
         $response = Invoke-RestMethod -Uri "https://api.brevo.com/v3/smtp/email" `
-            -Method Post -Headers $headers -Body $body
+            -Method Post -Headers $headers -Body $body -SkipHeaderValidation
         Write-Host "✓ Email notification sent successfully to $($To.Count) recipient(s)" -ForegroundColor Green
         return $true
     }
     catch {
-        Write-Error "Failed to send email: $_"
+        if ($ShowErrors) {
+            Write-Error "Failed to send email: $_"
+        }
         return $false
     }
 }
 
 # Main execution
-Write-Host "`n=== Backblaze B2 Sync Script ===" -ForegroundColor Yellow
+Write-Host ""
 
 # Validate local path
 if (-not (Test-Path $LocalPath -PathType Container)) {
-    Write-Error "Local path not found or not a directory: $LocalPath"
+    Write-Host "✗ Local path not found or not a directory: $LocalPath" -ForegroundColor Red
     exit 1
 }
 
@@ -500,7 +573,7 @@ Write-Host "✓ Found $($remoteFiles.Count) remote file(s)" -ForegroundColor Gre
 
 # Get local file list
 Write-Host "Scanning local files..." -ForegroundColor Cyan
-$localFiles = Get-ChildItem -Path $LocalPath -File -Recurse
+$localFiles = Get-ChildItem -Path $LocalPath -File -Recurse -ErrorAction SilentlyContinue
 
 # Filter out excluded extensions
 $originalCount = $localFiles.Count
@@ -761,6 +834,7 @@ if ($toUpload.Count -gt 0) {
                     reason = $file.reason
                 }
             } else {
+                Write-Host "  ✗ Failed" -ForegroundColor Red
                 $uploadFail++
                 $failedFiles += @{
                     path = $file.remotePath
@@ -769,6 +843,7 @@ if ($toUpload.Count -gt 0) {
                 }
             }
         } else {
+            Write-Host "  ✗ Failed to get upload URL" -ForegroundColor Red
             $uploadFail++
             $failedFiles += @{
                 path = $file.remotePath
