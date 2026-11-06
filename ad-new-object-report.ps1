@@ -632,7 +632,7 @@ function Get-DeletedADObjects {
         LDAPFilter            = "(&(isDeleted=TRUE)(!(isRecycled=TRUE))(whenChanged>=$(ConvertTo-LdapTime $SinceUtc))$($def.DeletedFilter))"
         SearchBase            = $script:DeletedObjectsDN
         IncludeDeletedObjects = $true
-        Properties            = @('whenChanged', 'lastKnownParent', 'msDS-LastKnownRDN', 'sAMAccountName', 'objectSid')
+        Properties            = @('whenCreated', 'whenChanged', 'lastKnownParent', 'msDS-LastKnownRDN', 'sAMAccountName', 'objectSid')
         Server                = $script:Server
     }
     return @(Get-ADObject @params)
@@ -651,10 +651,13 @@ function Get-DisabledADObjects {
 }
 
 function Get-AttributeChangeTime {
-    # When an attribute last changed (from replication metadata), or $null
-    param([string]$DistinguishedName, [string]$Attribute)
+    # When an attribute last changed (from replication metadata), or $null.
+    # Use -Deleted for objects in the Deleted Objects container.
+    param([string]$DistinguishedName, [string]$Attribute, [switch]$Deleted)
     try {
-        $meta = Get-ADReplicationAttributeMetadata -Object $DistinguishedName -Server $script:Server -Properties $Attribute -ErrorAction Stop |
+        $params = @{ Object = $DistinguishedName; Server = $script:Server; Properties = $Attribute; ErrorAction = 'Stop' }
+        if ($Deleted) { $params.IncludeDeletedObjects = $true }
+        $meta = Get-ADReplicationAttributeMetadata @params |
             Where-Object { $_.AttributeName -eq $Attribute } | Select-Object -First 1
         if ($meta -and $meta.LastOriginatingChangeTime) { return [datetime]$meta.LastOriginatingChangeTime }
     }
@@ -782,7 +785,7 @@ function Get-SampleRows {
         & $make 'Created'  'Computer' 'LON-LT-0142'         'LON-LT-0142$'     "OU=Laptops,OU=Devices,$dom"   30 'CORP\mpatel'          'audit log on DC02' $null
         & $make 'Created'  'Computer' 'DESKTOP-7Q3K9PL'     'DESKTOP-7Q3K9PL$' "CN=Computers,$dom"             8 'Unknown'              'no audit event found' $null
         & $make 'Created'  'Contact'  'Brightwell Ltd - Accounts' ''           "OU=External,OU=Contacts,$dom" 25 'CORP\akhan'           'audit log on DC01' $null
-        & $make 'Deleted'  'User'     'Tom Hughes'          'thughes'          "OU=Leavers,$dom"              41 'CORP\jbaker'          'audit log on DC01' $null
+        & $make 'Deleted'  'User'     'Tom Hughes'          'thughes'          "OU=Leavers,$dom"              41 'CORP\jbaker'          'audit log on DC01' (Get-Date -Year 2019 -Month 9 -Day 2)
         & $make 'Deleted'  'Group'    'SG-Project-Atlas'    'SG-Project-Atlas' "OU=Security,OU=Groups,$dom"   20 'CORP\mpatel'          'audit log on DC02' $null
         & $make 'Deleted'  'Computer' 'LON-DT-0031'         'LON-DT-0031$'     "OU=Desktops,OU=Devices,$dom"  15 'Unknown'              'no audit event found' $null
         & $make 'Disabled' 'User'     'Priya Shah'          'pshah'            "OU=Sales,OU=Staff,$dom"       33 'CORP\svc-hrprovision' 'audit log on DC02' $null
@@ -1158,6 +1161,7 @@ if (-not $PreviewHtmlPath) {
 
 $rows        = @()
 $reported    = @{}
+$seen        = @{}
 $newSnapshot = @{}
 $auditNote   = ''
 
@@ -1208,9 +1212,11 @@ else {
             }
             $count = 0
             foreach ($obj in $found) {
-                if ($reported.ContainsKey("Created|$($obj.ObjectGUID)")) { continue }
+                $key = "Created|$($obj.ObjectGUID)"
+                if ($reported.ContainsKey($key) -or $seen.ContainsKey($key)) { continue }
                 if (-not (Test-InScope ([string]$obj.DistinguishedName))) { continue }
                 $rows += ConvertFrom-LiveObject -Change 'Created' -Type $type -AdObject $obj -When $obj.whenCreated
+                $seen[$key] = $true
                 $count++
             }
             Write-Log "Created $type objects: $count"
@@ -1227,15 +1233,31 @@ else {
             }
             $count = 0
             foreach ($obj in $found) {
-                if ($reported.ContainsKey("Deleted|$($obj.ObjectGUID)")) { continue }
+                $key = "Deleted|$($obj.ObjectGUID)"
+                if ($reported.ContainsKey($key) -or $seen.ContainsKey($key)) { continue }
                 $parent = [string](Get-PropertyValue $obj 'lastKnownParent')
                 if (-not (Test-InScope "CN=x,$parent")) { continue }
+
+                # whenChanged on a deleted object can move after the deletion
+                # (e.g. link clean-up), so use the time isDeleted was set and
+                # skip objects that were actually deleted before this window.
+                $deletedAt = Get-AttributeChangeTime ([string]$obj.DistinguishedName) 'isDeleted' -Deleted
+                if ($deletedAt) {
+                    if ((ConvertTo-LocalDateTime $deletedAt).ToUniversalTime() -lt $windowStartUtc) { continue }
+                    $when = $deletedAt
+                }
+                else {
+                    $when = $obj.whenChanged
+                }
+
                 $name = [string](Get-PropertyValue $obj 'msDS-LastKnownRDN')
                 if (-not $name) { $name = ([string]$obj.Name -split "`n")[0] }
                 $rows += New-ChangeRow -Change 'Deleted' -Type $type -Name $name `
                     -AccountName ([string](Get-PropertyValue $obj 'sAMAccountName')) `
-                    -ParentDN $parent -When $obj.whenChanged -Guid ([string]$obj.ObjectGUID) `
-                    -Sid ([string](Get-PropertyValue $obj 'objectSid'))
+                    -ParentDN $parent -When $when -Guid ([string]$obj.ObjectGUID) `
+                    -Sid ([string](Get-PropertyValue $obj 'objectSid')) `
+                    -AccountCreated (Get-PropertyValue $obj 'whenCreated')
+                $seen[$key] = $true
                 $count++
             }
             Write-Log "Deleted $type objects: $count"
@@ -1335,14 +1357,24 @@ if (-not $PreviewSampleData -and $total -gt 0 -and $CreatorLookup -ne 'None') {
 # State to save after a successful run: drop keys older than the next window
 function Save-RunState {
     if ($isPreview) { return }
-    $cutoff = $runStartUtc.AddMinutes(-$OverlapMinutes)
+    # Created keys only need to cover the overlap window. Deleted keys are kept
+    # for longer, because a deleted object can be picked up again if it is
+    # changed after deletion and its exact deletion time cannot be read.
+    $cutoff        = $runStartUtc.AddMinutes(-$OverlapMinutes)
+    $deletedCutoff = $runStartUtc.AddDays(-30)
     $next   = @{}
     foreach ($key in $reported.Keys) {
-        if ($reported[$key] -ge $cutoff) { $next[$key] = $reported[$key] }
+        if ($key -like 'Deleted|*') { $keep = $reported[$key] -ge $deletedCutoff }
+        else { $keep = $reported[$key] -ge $cutoff }
+        if ($keep) { $next[$key] = $reported[$key] }
     }
     foreach ($row in $rows) {
-        if (($row.Change -eq 'Created' -or $row.Change -eq 'Deleted') -and $row.WhenUtc -ge $cutoff) {
-            $next["$($row.Change)|$($row.Guid)"] = $row.WhenUtc
+        if ($row.Change -eq 'Created' -and $row.WhenUtc -ge $cutoff) {
+            $next["Created|$($row.Guid)"] = $row.WhenUtc
+        }
+        elseif ($row.Change -eq 'Deleted') {
+            # Stored with the run time so the 30 days count from when it was reported
+            $next["Deleted|$($row.Guid)"] = $runStartUtc
         }
     }
     try {
