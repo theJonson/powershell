@@ -25,7 +25,8 @@
 
 .PARAMETER ObjectTypes
     Object types to report on. Any of: User, Group, Computer, Contact,
-    OrganizationalUnit. Default: User.
+    OrganizationalUnit. Default: User. Separate multiple types with commas,
+    e.g. User,Group,Computer (also works when run via powershell.exe -File).
 
 .PARAMETER SearchBase
     Optional DN to limit the search to (default: whole domain).
@@ -33,6 +34,7 @@
 .PARAMETER ExcludeOU
     Optional list of OU/container DNs to ignore (objects inside them, at any
     depth, are skipped). Useful for staging OUs used by automated processes.
+    DNs contain commas, so separate multiple DNs with a semicolon.
 
 .PARAMETER Server
     Domain controller to query. Defaults to the PDC emulator so that every run
@@ -60,7 +62,8 @@
     machine, so create it as the account the scheduled task runs as.
 
 .PARAMETER EmailTo
-    One or more recipient addresses.
+    One or more recipient addresses, separated by commas or semicolons. All
+    recipients appear on the To line and can see each other.
 
 .PARAMETER EmailFrom
     Sender address (must be a verified sender in Brevo).
@@ -96,6 +99,18 @@
 .PARAMETER LogPath
     Optional log file path. Lines are appended.
 
+.PARAMETER CreatorLookup
+    How to work out who created each object:
+      Auto     - DC Security audit log first, then the object owner (default)
+      AuditLog - DC Security audit log only
+      Owner    - object owner only (no auditing needed, less precise)
+      None     - do not show a creator
+    See NOTES for the audit configuration required.
+
+.PARAMETER DomainControllers
+    DCs whose Security logs are searched for creation events. Default: every
+    writable DC in the domain. Separate multiple names with commas.
+
 .EXAMPLE
     .\ad-new-object-report.ps1 -BrevoApiKeyPath C:\Scripts\brevo.key.xml -EmailTo it@example.co.uk -EmailFrom alerts@example.co.uk
 
@@ -112,10 +127,55 @@
     Renders the email template with sample data without touching AD or Brevo.
 
 .NOTES
+    CREATOR LOOKUP - WHAT NEEDS TO BE CONFIGURED
+
+    The creator is read from the Security event log of the DC where the object
+    was created, so every writable DC must log these events, and the account
+    running the script must be able to read them remotely.
+
+    1. Audit policy (Group Policy linked to the Domain Controllers OU, e.g.
+       Default Domain Controllers Policy):
+         Computer Configuration > Policies > Windows Settings > Security
+         Settings > Advanced Audit Policy Configuration > Audit Policies >
+         Account Management:
+           - Audit User Account Management         : Success   (4720)
+           - Audit Computer Account Management     : Success   (4741)
+           - Audit Security Group Management       : Success   (4727, 4731, 4754)
+           - Audit Distribution Group Management   : Success   (4744, 4749, 4759)
+         DS Access (only needed for contacts and OUs, or as a catch-all):
+           - Audit Directory Service Changes       : Success   (5137)
+       And under Security Options:
+           - Audit: Force audit policy subcategory settings (Windows Vista or
+             later) to override audit policy category settings : Enabled
+       Check on each DC with:  auditpol /get /category:"Account Management","DS Access"
+
+    2. SACL for event 5137 (contacts and OUs only). Event 5137 is only logged
+       when the object's parent has an auditing entry for creating children.
+       In ADSI Edit or ADUC (Advanced Features), on the domain root:
+         Properties > Security > Advanced > Auditing > Add
+           Principal: Everyone, Type: Success, Applies to: This object and
+           all descendant objects, Permission: Create all child objects
+
+    3. Security log size. The events must still be in the log when the script
+       runs. Set the Security log maximum size on DCs to at least 1 GB
+       (Event Log policy or wevtutil sl Security /ms:1073741824) and keep
+       the schedule interval short (hourly is ideal).
+
+    4. Remote log access for the script's account:
+         - Add the account to the domain's built-in "Event Log Readers" group
+           (applies to all DCs).
+         - Allow the inbound firewall rule group "Remote Event Log
+           Management" on the DCs.
+       Test with:  Get-WinEvent -ComputerName DC01 -LogName Security -MaxEvents 1
+
+    If no audit event is found, Auto falls back to the object owner. The owner
+    is the creator when a delegated (non-admin) account creates the object, but
+    it is "Domain Admins" when any Domain Admin creates it.
+
     Scheduled task example (run as a service account that can read AD):
 
     $script = 'C:\Scripts\ad-new-object-report.ps1'
-    $arg    = "-NoProfile -ExecutionPolicy Bypass -File `"$script`" -BrevoApiKeyPath C:\Scripts\brevo.key.xml -EmailTo it@example.co.uk -EmailFrom alerts@example.co.uk -LogPath C:\Scripts\ad-new-object-report.log"
+    $arg    = "-NoProfile -ExecutionPolicy Bypass -File `"$script`" -BrevoApiKeyPath C:\Scripts\brevo.key.xml -ObjectTypes User,Group,Computer -EmailTo it@example.co.uk,helpdesk@example.co.uk -EmailFrom alerts@example.co.uk -LogPath C:\Scripts\ad-new-object-report.log"
     $action  = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arg
     $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date -RepetitionInterval (New-TimeSpan -Hours 1)
     Register-ScheduledTask -TaskName 'AD New Object Report' -Action $action -Trigger $trigger -User 'DOMAIN\svc-adreport' -Password '<password>' -RunLevel Limited
@@ -123,7 +183,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('User', 'Group', 'Computer', 'Contact', 'OrganizationalUnit')]
+    # Validated after splitting, so that -File "User,Group" also works
     [string[]]$ObjectTypes = @('User'),
 
     [string]$SearchBase = '',
@@ -164,7 +224,12 @@ param(
 
     [switch]$PreviewSampleData,
 
-    [string]$LogPath = ''
+    [string]$LogPath = '',
+
+    [ValidateSet('Auto', 'AuditLog', 'Owner', 'None')]
+    [string]$CreatorLookup = 'Auto',
+
+    [string[]]$DomainControllers = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -213,8 +278,33 @@ $TypeDefinitions = [ordered]@{
     }
 }
 
+# Security log event IDs that record who created each type of object.
+# 5137 (Directory Service Changes) covers every type and is always included.
+$CreationEventIds = @{
+    User     = @(4720)
+    Computer = @(4741)
+    Group    = @(4727, 4731, 4744, 4749, 4754, 4759)
+}
+$DsObjectCreatedEventId = 5137
+
+# powershell.exe -File passes "a,b" as one string, so split list parameters here
+function Split-ListParameter {
+    param([string[]]$Value, [string]$Pattern = '[,;]')
+    return @($Value | ForEach-Object { $_ -split $Pattern } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+$requestedTypes    = Split-ListParameter $ObjectTypes
+$EmailTo           = Split-ListParameter $EmailTo
+$ExcludeOU         = Split-ListParameter $ExcludeOU ';'
+$DomainControllers = Split-ListParameter $DomainControllers
+
+$unknownTypes = @($requestedTypes | Where-Object { @($TypeDefinitions.Keys) -notcontains $_ })
+if ($unknownTypes.Count -gt 0) {
+    Write-Host ("Unknown object type(s): {0}. Valid types: {1}" -f ($unknownTypes -join ', '), (@($TypeDefinitions.Keys) -join ', ')) -ForegroundColor Red
+    exit 1
+}
+
 # Keep the requested types in the table's display order, without duplicates
-$ObjectTypes = @($TypeDefinitions.Keys | Where-Object { $ObjectTypes -contains $_ })
+$ObjectTypes = @($TypeDefinitions.Keys | Where-Object { $requestedTypes -contains $_ })
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -299,6 +389,10 @@ function New-ReportRow {
     $dn       = [string](Get-PropertyValue $AdObject 'DistinguishedName')
     $parentDN = Get-ParentDN $dn
 
+    $owner = ''
+    $sd = Get-PropertyValue $AdObject 'nTSecurityDescriptor'
+    if ($sd) { $owner = [string]$sd.Owner }
+
     return [pscustomobject]@{
         Type             = $Type
         Name             = [string](Get-PropertyValue $AdObject 'Name')
@@ -309,6 +403,10 @@ function New-ReportRow {
         CreatedUtc       = $createdLocal.ToUniversalTime()
         Guid             = [string](Get-PropertyValue $AdObject 'ObjectGUID')
         DefaultContainer = ($parentDN -match '^CN=(Users|Computers),DC=')
+        Sid              = [string](Get-PropertyValue $AdObject 'objectSid')
+        Owner            = $owner
+        CreatedBy        = ''
+        CreatedBySource  = ''
     }
 }
 
@@ -354,11 +452,96 @@ function Get-NewADObjects {
     $when = $SinceUtc.ToString('yyyyMMddHHmmss', $script:Invariant) + '.0Z'
     $params = @{
         LDAPFilter = "(&(whenCreated>=$when)$($def.Filter))"
-        Properties = @('whenCreated', 'canonicalName', 'sAMAccountName')
+        Properties = @('whenCreated', 'canonicalName', 'sAMAccountName', 'objectSid')
         Server     = $script:Server
+    }
+    if ($script:CreatorLookup -eq 'Auto' -or $script:CreatorLookup -eq 'Owner') {
+        $params.Properties += 'nTSecurityDescriptor'
     }
     if ($script:SearchBase) { $params.SearchBase = $script:SearchBase }
     return @(Get-ADObject @params)
+}
+
+function Get-CreationAuditEvents {
+    # Reads creation events from each DC's Security log in one query per DC.
+    # Returns lookups keyed by SID (account management events) and by GUID (5137).
+    param([string[]]$Computers, [string[]]$Types, [datetime]$SinceUtc)
+
+    $ids = @($script:DsObjectCreatedEventId)
+    foreach ($t in $Types) {
+        if ($script:CreationEventIds.ContainsKey($t)) { $ids += $script:CreationEventIds[$t] }
+    }
+    # Small margin for clock differences between DCs
+    $start = $SinceUtc.AddMinutes(-5).ToLocalTime()
+
+    $bySid  = @{}
+    $byGuid = @{}
+    $failed = @()
+
+    foreach ($dc in $Computers) {
+        $shortName = ($dc -split '\.')[0]
+        try {
+            $events = @(Get-WinEvent -ComputerName $dc -ErrorAction Stop -FilterHashtable @{
+                LogName = 'Security'; Id = [int[]]$ids; StartTime = $start
+            })
+        }
+        catch {
+            if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') {
+                $events = @()
+            }
+            else {
+                Write-Log "Could not read the Security log on ${dc}: $($_.Exception.Message)" 'WARN'
+                $failed += $shortName
+                continue
+            }
+        }
+        Write-Log "Audit log on ${dc}: $($events.Count) creation event(s)"
+
+        foreach ($ev in $events) {
+            $data = @{}
+            foreach ($d in ([xml]$ev.ToXml()).Event.EventData.Data) { $data[[string]$d.Name] = [string]$d.'#text' }
+            $info = [pscustomobject]@{
+                CreatedBy = '{0}\{1}' -f $data['SubjectDomainName'], $data['SubjectUserName']
+                Source    = "audit log on $shortName"
+            }
+            if ($ev.Id -eq $script:DsObjectCreatedEventId) {
+                if ($data['ObjectGUID']) { $byGuid[$data['ObjectGUID'].Trim('{', '}')] = $info }
+            }
+            elseif ($data['TargetSid']) {
+                $bySid[$data['TargetSid']] = $info
+            }
+        }
+    }
+
+    return [pscustomobject]@{ BySid = $bySid; ByGuid = $byGuid; FailedDCs = $failed }
+}
+
+function Set-RowCreators {
+    param([object[]]$Rows, $Audit, [string]$Mode)
+    foreach ($row in $Rows) {
+        $hit = $null
+        if ($Audit) {
+            if ($row.Sid -and $Audit.BySid.ContainsKey($row.Sid)) { $hit = $Audit.BySid[$row.Sid] }
+            elseif ($Audit.ByGuid.ContainsKey($row.Guid)) { $hit = $Audit.ByGuid[$row.Guid] }
+        }
+        if ($hit) {
+            $row.CreatedBy       = $hit.CreatedBy
+            $row.CreatedBySource = $hit.Source
+        }
+        elseif (($Mode -eq 'Auto' -or $Mode -eq 'Owner') -and $row.Owner) {
+            $row.CreatedBy = $row.Owner
+            if ($row.Owner -match '\\(Domain Admins|Enterprise Admins|Administrators)$') {
+                $row.CreatedBySource = 'object owner (any member of this group)'
+            }
+            else {
+                $row.CreatedBySource = 'object owner'
+            }
+        }
+        else {
+            $row.CreatedBy       = 'Unknown'
+            $row.CreatedBySource = 'no audit event found'
+        }
+    }
 }
 
 function Get-SampleObjects {
@@ -368,7 +551,7 @@ function Get-SampleObjects {
     $dom  = 'DC=corp,DC=example,DC=co,DC=uk'
     $cdom = 'corp.example.co.uk'
     $make = {
-        param($Type, $Name, $Sam, $OuDN, $OuCanonical, $MinutesAgo)
+        param($Type, $Name, $Sam, $OuDN, $OuCanonical, $MinutesAgo, $By, $BySource)
         [pscustomobject]@{
             Type              = $Type
             Name              = $Name
@@ -377,16 +560,18 @@ function Get-SampleObjects {
             canonicalName     = "$cdom/$OuCanonical/$Name"
             whenCreated       = $now.AddMinutes(-$MinutesAgo)
             ObjectGUID        = [guid]::NewGuid()
+            SampleCreatedBy   = $By
+            SampleSource      = $BySource
         }
     }
     $all = @(
-        & $make 'User'     'Sarah Thompson'       'sthompson'    "OU=Finance,OU=Staff,$dom"         'Staff/Finance'      52
-        & $make 'User'     "Emily O'Brien"        'eobrien'      "OU=Marketing,OU=Staff,$dom"       'Staff/Marketing'    37
-        & $make 'User'     'Test User1'           'testuser1'    "CN=Users,$dom"                    'Users'              12
-        & $make 'Group'    'SG-Finance-ReadOnly'  'SG-Finance-ReadOnly' "OU=Security,OU=Groups,$dom" 'Groups/Security' 45
-        & $make 'Computer' 'LON-LT-0142'          'LON-LT-0142$' "OU=Laptops,OU=Devices,$dom"       'Devices/Laptops'    30
-        & $make 'Computer' 'DESKTOP-7Q3K9PL'      'DESKTOP-7Q3K9PL$' "CN=Computers,$dom"            'Computers'          8
-        & $make 'Contact'  'Brightwell Ltd - Accounts' $null     "OU=External,OU=Contacts,$dom"     'Contacts/External'  25
+        & $make 'User'     'Sarah Thompson'       'sthompson'    "OU=Finance,OU=Staff,$dom"         'Staff/Finance'      52 'CORP\jbaker'          'audit log on DC01'
+        & $make 'User'     "Emily O'Brien"        'eobrien'      "OU=Marketing,OU=Staff,$dom"       'Staff/Marketing'    37 'CORP\svc-hrprovision' 'audit log on DC02'
+        & $make 'User'     'Test User1'           'testuser1'    "CN=Users,$dom"                    'Users'              12 'CORP\Domain Admins'   'object owner (any member of this group)'
+        & $make 'Group'    'SG-Finance-ReadOnly'  'SG-Finance-ReadOnly' "OU=Security,OU=Groups,$dom" 'Groups/Security' 45 'CORP\jbaker'          'audit log on DC01'
+        & $make 'Computer' 'LON-LT-0142'          'LON-LT-0142$' "OU=Laptops,OU=Devices,$dom"       'Devices/Laptops'    30 'CORP\mpatel'          'audit log on DC02'
+        & $make 'Computer' 'DESKTOP-7Q3K9PL'      'DESKTOP-7Q3K9PL$' "CN=Computers,$dom"            'Computers'          8  'Unknown'              'no audit event found'
+        & $make 'Contact'  'Brightwell Ltd - Accounts' $null     "OU=External,OU=Contacts,$dom"     'Contacts/External'  25 'CORP\akhan'           'audit log on DC01'
     )
     return @($all | Where-Object { $Types -contains $_.Type })
 }
@@ -408,12 +593,14 @@ function Build-ReportHtml {
         [datetime]$PeriodEndUtc,
         [int]$MaxRows,
         [int]$BulkThreshold,
-        [bool]$CsvAttached
+        [bool]$CsvAttached,
+        [bool]$ShowCreator,
+        [string]$AuditNote = ''
     )
 
     $inv       = $script:Invariant
     $periodFmt = 'dd/MM/yyyy HH:mm'
-    $rowFmt    = 'dd/MM/yyyy HH:mm:ss'
+    if ($ShowCreator) { $w = @(25, 35, 22, 18) } else { $w = @(32, 44, 0, 24) }
     $total     = @($Rows).Count
     $font      = "font-family:'Segoe UI',Arial,Helvetica,sans-serif;"
     $periodTxt = '{0} to {1}' -f $PeriodStartUtc.ToLocalTime().ToString($periodFmt, $inv),
@@ -497,9 +684,14 @@ No new objects were created in this period. This email confirms the scheduled ch
 <tr><td style="padding:10px 28px 0 28px;">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid #e2e8f0;border-collapse:collapse;">
 <tr style="background-color:#f8fafc;">
-<th align="left" width="32%" style="padding:8px 10px;border-bottom:1px solid #e2e8f0;$font font-size:12px;color:#64748b;text-transform:uppercase;">Name</th>
-<th align="left" width="44%" style="padding:8px 10px;border-bottom:1px solid #e2e8f0;$font font-size:12px;color:#64748b;text-transform:uppercase;">Location (OU)</th>
-<th align="left" width="24%" style="padding:8px 10px;border-bottom:1px solid #e2e8f0;$font font-size:12px;color:#64748b;text-transform:uppercase;">Created</th>
+<th align="left" width="$($w[0])%" style="padding:8px 10px;border-bottom:1px solid #e2e8f0;$font font-size:12px;color:#64748b;text-transform:uppercase;">Name</th>
+<th align="left" width="$($w[1])%" style="padding:8px 10px;border-bottom:1px solid #e2e8f0;$font font-size:12px;color:#64748b;text-transform:uppercase;">Location (OU)</th>
+"@)
+        if ($ShowCreator) {
+            [void]$sb.AppendLine("<th align=`"left`" width=`"$($w[2])%`" style=`"padding:8px 10px;border-bottom:1px solid #e2e8f0;$font font-size:12px;color:#64748b;text-transform:uppercase;`">Created by</th>")
+        }
+        [void]$sb.AppendLine(@"
+<th align="left" width="$($w[3])%" style="padding:8px 10px;border-bottom:1px solid #e2e8f0;$font font-size:12px;color:#64748b;text-transform:uppercase;">Created</th>
 </tr>
 "@)
         foreach ($row in $shownRows) {
@@ -512,15 +704,22 @@ No new objects were created in this period. This email confirms the scheduled ch
                 $locHtml += ' <span style="display:inline-block;background-color:#fef3c7;color:#92400e;font-size:11px;font-weight:bold;padding:1px 6px;border-radius:3px;">DEFAULT CONTAINER</span>'
             }
             $locHtml += '</div><div style="font-size:11px;color:#94a3b8;word-break:break-all;">' + (ConvertTo-HtmlText $row.ParentDN) + '</div>'
-            $createdTxt = $row.Created.ToString($rowFmt, $inv)
+            $createdHtml = '<div>' + $row.Created.ToString('dd/MM/yyyy', $inv) + '</div><div style="font-size:12px;color:#64748b;">' + $row.Created.ToString('HH:mm:ss', $inv) + '</div>'
+            $cellStyle = "padding:10px;border-bottom:1px solid #f1f5f9;$font font-size:14px;"
 
-            [void]$sb.AppendLine(@"
-<tr>
-<td valign="top" style="padding:10px;border-bottom:1px solid #f1f5f9;$font font-size:14px;">$nameHtml</td>
-<td valign="top" style="padding:10px;border-bottom:1px solid #f1f5f9;$font font-size:14px;">$locHtml</td>
-<td valign="top" style="padding:10px;border-bottom:1px solid #f1f5f9;$font font-size:14px;color:#334155;white-space:nowrap;">$createdTxt</td>
-</tr>
-"@)
+            [void]$sb.AppendLine('<tr>')
+            [void]$sb.AppendLine("<td valign=`"top`" style=`"$cellStyle`">$nameHtml</td>")
+            [void]$sb.AppendLine("<td valign=`"top`" style=`"$cellStyle`">$locHtml</td>")
+            if ($ShowCreator) {
+                if ($row.CreatedBy -eq 'Unknown') { $byColour = '#94a3b8' } else { $byColour = '#0f172a' }
+                $byHtml = '<div style="color:' + $byColour + ';">' + (ConvertTo-HtmlText $row.CreatedBy) + '</div>'
+                if ($row.CreatedBySource) {
+                    $byHtml += '<div style="font-size:11px;color:#94a3b8;">' + (ConvertTo-HtmlText $row.CreatedBySource) + '</div>'
+                }
+                [void]$sb.AppendLine("<td valign=`"top`" style=`"$cellStyle`">$byHtml</td>")
+            }
+            [void]$sb.AppendLine("<td valign=`"top`" style=`"$cellStyle color:#334155;white-space:nowrap;`">$createdHtml</td>")
+            [void]$sb.AppendLine('</tr>')
         }
         [void]$sb.AppendLine('</table></td></tr>')
 
@@ -538,6 +737,7 @@ Showing $($shownRows.Count) of $($typeRows.Count) $(ConvertTo-HtmlText $def.Plur
     $tzName   = [TimeZoneInfo]::Local.StandardName
     $csvNote  = ''
     if ($CsvAttached) { $csvNote = '<br>A CSV file containing every object in this report is attached.' }
+    if ($AuditNote) { $csvNote += '<br>' + (ConvertTo-HtmlText $AuditNote) }
     [void]$sb.AppendLine(@"
 <tr><td style="padding:28px 28px 24px 28px;$font font-size:12px;color:#94a3b8;line-height:18px;">
 <hr style="border:none;border-top:1px solid #e2e8f0;margin:0 0 12px 0;">
@@ -623,7 +823,7 @@ function Send-BrevoEmail {
 
 function New-CsvAttachment {
     param([object[]]$Rows, [string]$FileName)
-    $csv = $Rows | Sort-Object Type, Created | Select-Object Type, Name, AccountName, OuPath, ParentDN,
+    $csv = $Rows | Sort-Object Type, Created | Select-Object Type, Name, AccountName, OuPath, ParentDN, CreatedBy, CreatedBySource,
         @{ n = 'Created'; e = { $_.Created.ToString('yyyy-MM-dd HH:mm:ss', $script:Invariant) } },
         Guid | ConvertTo-Csv -NoTypeInformation
     $text  = ($csv -join "`r`n") + "`r`n"
@@ -644,7 +844,6 @@ Write-Log "Object types: $($ObjectTypes -join ', ')"
 # Validate email settings before doing any work
 $apiKey = ''
 if (-not $PreviewHtmlPath) {
-    $EmailTo = @($EmailTo | Where-Object { $_ })
     if ($EmailTo.Count -eq 0 -or -not $EmailFrom) {
         Write-Log 'EmailTo and EmailFrom are required unless -PreviewHtmlPath is used.' 'ERROR'
         exit 1
@@ -660,15 +859,23 @@ if (-not $PreviewHtmlPath) {
     }
 }
 
-$rows     = @()
-$reported = @{}
+$rows      = @()
+$reported  = @{}
+$auditNote = ''
+
 
 if ($PreviewSampleData) {
     Write-Log 'Using sample data (AD will not be queried).' 'WARN'
     $domainName     = 'corp.example.co.uk'
     $Server         = 'DC01.corp.example.co.uk'
     $periodStartUtc = $runStartUtc.AddHours(-1)
-    $rows = @(Get-SampleObjects -Types $ObjectTypes | ForEach-Object { New-ReportRow -Type $_.Type -AdObject $_ })
+    $rows = @(Get-SampleObjects -Types $ObjectTypes | ForEach-Object {
+        $row = New-ReportRow -Type $_.Type -AdObject $_
+        $row.CreatedBy       = $_.SampleCreatedBy
+        $row.CreatedBySource = $_.SampleSource
+        $row
+    })
+    if ($CreatorLookup -ne 'None') { $auditNote = 'Created by is read from DC Security logs, falling back to the object owner.' }
 }
 else {
     try {
@@ -718,6 +925,36 @@ else {
 $total = $rows.Count
 Write-Log "Total new objects: $total"
 
+# Work out who created each object
+if (-not $PreviewSampleData -and $total -gt 0 -and $CreatorLookup -ne 'None') {
+    $audit = $null
+    if ($CreatorLookup -eq 'Auto' -or $CreatorLookup -eq 'AuditLog') {
+        try {
+            if ($DomainControllers.Count -eq 0) {
+                $DomainControllers = @(Get-ADDomainController -Filter * -Server $Server |
+                    Where-Object { -not $_.IsReadOnly } | ForEach-Object { $_.HostName })
+            }
+            $audit = Get-CreationAuditEvents -Computers $DomainControllers -Types $ObjectTypes -SinceUtc $windowStartUtc
+            $auditNote = 'Created by is read from DC Security logs'
+            if ($CreatorLookup -eq 'Auto') { $auditNote += ', falling back to the object owner' }
+            $auditNote += '.'
+            if ($audit.FailedDCs.Count -gt 0) {
+                $auditNote += ' Audit log could not be read on: ' + ($audit.FailedDCs -join ', ') + '.'
+            }
+        }
+        catch {
+            Write-Log "Creator lookup from audit logs failed: $($_.Exception.Message)" 'WARN'
+            $auditNote = 'Audit logs could not be read; creator shown from the object owner where available.'
+        }
+    }
+    else {
+        $auditNote = 'Created by is the object owner (audit logs not checked).'
+    }
+    Set-RowCreators -Rows $rows -Audit $audit -Mode $CreatorLookup
+    $unknown = @($rows | Where-Object { $_.CreatedBy -eq 'Unknown' }).Count
+    if ($unknown -gt 0) { Write-Log "$unknown object(s) with unknown creator" 'WARN' }
+}
+
 # State to save after a successful run: drop GUIDs older than the next window
 function Save-RunState {
     if ($isPreview) { return }
@@ -753,7 +990,8 @@ $attachCsv = ($total -gt 0) -and ($truncated -or $AlwaysAttachCsv)
 
 $html = Build-ReportHtml -Rows $rows -Types $ObjectTypes -DomainName $domainName -QueryServer $Server `
     -PeriodStartUtc $periodStartUtc -PeriodEndUtc $runStartUtc -MaxRows $MaxRowsPerType `
-    -BulkThreshold $BulkWarningThreshold -CsvAttached $attachCsv
+    -BulkThreshold $BulkWarningThreshold -CsvAttached $attachCsv `
+    -ShowCreator ($CreatorLookup -ne 'None') -AuditNote $auditNote
 $subject = Get-ReportSubject -Rows $rows -Types $ObjectTypes -DomainName $domainName -BulkThreshold $BulkWarningThreshold
 
 if ($PreviewHtmlPath) {
